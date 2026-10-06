@@ -13,8 +13,11 @@
    进程在释放后、发布前崩溃并重启，事务整体回滚，不会双重归属。
 4. 确认过期（无进行中交接）、越权（非当前持有者）、含多余分区一律拒绝，且不推进代次。
 5. 稳定请求标识幂等：相同请求重传返回首次结果；同一标识携带不同快照明确冲突（409）。
-6. 交接进行中收到新快照会被暂时拒绝（409），响应内带**已持久化目标**，
-   调用方必须据此重新收敛，而不是按本地旧状态抢占。
+6. 交接进行中收到**后续完整成员快照**会被受理为排队（`202 queued`，至多一份），
+   响应内带**已持久化目标**供调用方重新收敛；当前轮最后一次确认完成的同一事务内，
+   排队快照基于已持久化的当前归属继续形成下一轮一致交接（确认响应以 `next_handover` 公布）。
+   复用排队标识但成员不同、或排队槽已被另一份快照占用，一律明确冲突（409）；
+   崩溃重启不会丢失已受理排队快照（启动时补做推广）。
 
 目标分配完全由「成员标识 + 分区号」确定：`target = sorted(members)[int(part) % len(members)]`，
 因此重算结果稳定且与顺序无关。
@@ -29,18 +32,26 @@
 | POST | `/v1/snapshots` | `{"request_id","members"}` 提交完整成员快照 |
 | POST | `/v1/confirms` | `{"request_id","member","parts"}` 旧实例确认撤销 |
 
-状态码：`200` 稳定/已记录，`202` 已进入撤销，`400` 参数或多余分区，
-`403` 越权确认，`409` 确认过期 / 幂等冲突 / 交接进行中，`503` 存储不可用。
+状态码：`200` 稳定/已记录，`202` 已进入撤销，或已受理排队（`queued`），
+`400` 参数或多余分区，`403` 越权确认，
+`409` 确认过期 / 幂等冲突 / 排队槽已被另一份快照占用，`503` 存储不可用。
 
 ### 典型时序
 
 ```http
 POST /v1/snapshots {"request_id":"r1","members":["a","b"]}   -> 200 stable
 POST /v1/snapshots {"request_id":"r2","members":["b","c"]}   -> 202 revoking
-GET  /v1/assignments?member=c                                -> 0 个分区（确认前拿不到）
+POST /v1/snapshots {"request_id":"r3","members":["c","d"]}   -> 202 queued（撤销期间受理，至多一份）
+GET  /v1/assignments?member=d                                -> 0 个分区（确认前拿不到）
 POST /v1/confirms  {"request_id":"c1","member":"a","parts":["0","2","4"]}  -> 200 partially_released, epoch 1
 POST /v1/confirms  {"request_id":"c2","member":"b","parts":["1","3","5"]}  -> 200 completed, epoch 2
-# 任一请求重传（同 request_id 同体）-> 原样返回首次结果
+                                                            # 同一事务内推广 r3：
+                                                            # next_handover.status=revoking
+GET  /v1/handover                                            -> active, request_id=r3
+POST /v1/confirms  {"request_id":"c3","member":"b","parts":["0","2","4"]}  -> 200 partially_released, epoch 3
+POST /v1/confirms  {"request_id":"c4","member":"c","parts":["1","3","5"]}  -> 200 completed, epoch 4
+# r3 相同请求重传（同 request_id 同体）-> 原样返回首次（revoking）结果；
+# 复用 r3 但成员不同、或排队槽已有快照时提交其它快照 -> 409
 ```
 
 ## 运行
@@ -59,8 +70,8 @@ PARTITION_COUNT=1024 docker compose up -d
 
 ### 单次 verify 容器
 
-围绕**成员替换、失效确认、中断恢复**运行规则测试、镜像构建自检与 API 冒烟，
-以状态码退出（0 成功）：
+围绕**三次连续成员快照的串联交接（含撤销期间受理与重启收敛）、失效确认、
+中断恢复**运行规则测试、镜像构建自检与 API 冒烟，以状态码退出（0 成功）：
 
 ```bash
 docker compose --profile verify run --rm verify
@@ -91,5 +102,5 @@ python -m unittest discover -s tests
 app/store.py     持久化与交接协议（单事务原子发布、幂等、恢复）
 app/server.py    标准库 HTTP 服务
 verify.py        单次校验入口（规则测试 + 构建自检 + API 冒烟）
-tests/           27 个规则/HTTP 测试，含崩溃注入与跨连接并发
+tests/           38 个规则/HTTP 测试，含连续快照串联、崩溃注入与跨连接并发
 ```

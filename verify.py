@@ -58,48 +58,92 @@ def http_request(method: str, url: str, body: dict | None = None) -> tuple[int, 
 
 
 def run_api_smoke() -> bool:
-    step("API 冒烟（真实服务进程）")
+    step("API 冒烟（真实服务进程：连续三次快照 + 撤销期间受理 + 重启收敛）")
     tmp = tempfile.TemporaryDirectory()
     port = int(os.environ.get("SMOKE_PORT", "18080"))
+    db_path = os.path.join(tmp.name, "smoke.db")
+    base = f"http://127.0.0.1:{port}"
     env = {
         **os.environ,
         "HOST": "127.0.0.1",
         "PORT": str(port),
-        "DB_PATH": os.path.join(tmp.name, "smoke.db"),
+        "DB_PATH": db_path,
         "PARTITION_COUNT": "6",
         "QUIET": "1",
     }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "app.server"],
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    base = f"http://127.0.0.1:{port}"
     ok = False
-    try:
+
+    def start_server() -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "app.server"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
         for _ in range(50):
             try:
                 code, body = http_request("GET", f"{base}/healthz")
                 if code == 200 and body.get("status") == "ok":
-                    break
+                    return proc
             except OSError:
                 pass
             time.sleep(0.1)
-        else:
-            raise AssertionError("服务健康端点未在超时内就绪")
+        raise AssertionError("服务健康端点未在超时内就绪")
 
+    def stop_server(proc: subprocess.Popen) -> None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    proc = start_server()
+    try:
+        # 第一次快照：稳定分配
         code, _ = http_request(
             "POST", f"{base}/v1/snapshots",
             {"request_id": "smoke-r1", "members": ["a", "b"]},
         )
         assert code == 200, code
+        # 第二次快照：触发撤销
         code, body = http_request(
             "POST", f"{base}/v1/snapshots",
             {"request_id": "smoke-r2", "members": ["b", "c"]},
         )
-        assert code == 202 and len(body["revocations"]) == 6, body
+        assert code == 202 and body["status"] == "revoking", body
+        assert len(body["revocations"]) == 6, body
+        # 第三次快照：撤销期间被受理（queued），携带已持久化目标
+        code, queued = http_request(
+            "POST", f"{base}/v1/snapshots",
+            {"request_id": "smoke-r3", "members": ["c", "d"]},
+        )
+        assert code == 202 and queued["status"] == "queued", queued
+        assert queued["after_handover"] == "smoke-r2", queued
+
+        # 冲突规则：复用标识但成员不同 / 已有另一份等待快照
+        code, body = http_request(
+            "POST", f"{base}/v1/snapshots",
+            {"request_id": "smoke-r3", "members": ["c", "e"]},
+        )
+        assert code == 409 and body["error"] == "idempotency_conflict", body
+        code, body = http_request(
+            "POST", f"{base}/v1/snapshots",
+            {"request_id": "smoke-r4", "members": ["e", "f"]},
+        )
+        assert code == 409 and body["error"] == "deferred_snapshot_pending", body
+        # 排队标识不能用于确认
+        code, body = http_request(
+            "POST", f"{base}/v1/confirms",
+            {"request_id": "smoke-r3", "member": "a", "parts": ["0"]},
+        )
+        assert code == 409 and body["error"] == "idempotency_conflict", body
+        # 相同标识 + 相同成员快照稳定重放排队受理
+        code, replay = http_request(
+            "POST", f"{base}/v1/snapshots",
+            {"request_id": "smoke-r3", "members": ["c", "d"]},
+        )
+        assert code == 202 and replay == queued, (replay, queued)
 
         # 失效确认：越权与多余分区必须被拒绝且不推进
         code, body = http_request(
@@ -114,37 +158,85 @@ def run_api_smoke() -> bool:
         assert code == 400 and body["error"] == "unexpected_partitions", body
         code, view = http_request("GET", f"{base}/v1/assignments")
         assert view["epoch"] == 0 and view["assignments"]["0"]["owner"] == "a", view
-
-        # 幂等：同 id 不同快照冲突
+        # 幂等冲突：同 snapshot id 不同快照
         code, body = http_request(
             "POST", f"{base}/v1/snapshots",
             {"request_id": "smoke-r1", "members": ["x"]},
         )
         assert code == 409, body
 
-        # 合法确认完成交接
+        # 第二轮第一次合法确认：部分释放，排队快照不得提前推广
+        code, body = http_request(
+            "POST", f"{base}/v1/confirms",
+            {"request_id": "smoke-c1", "member": "a", "parts": ["0", "2", "4"]},
+        )
+        assert code == 200 and body["status"] == "partially_released", body
+        assert "next_handover" not in body, body
+        code, replay = http_request(
+            "POST", f"{base}/v1/confirms",
+            {"request_id": "smoke-c1", "member": "a", "parts": ["0", "2", "4"]},
+        )
+        assert replay == body, "重传必须返回首次结果"
+
+        # 读模型单一归属：已释放分区归 b，未释放仍在 b（撤销目标 c）
+        code, view = http_request("GET", f"{base}/v1/assignments")
+        owners = [v["owner"] for v in view["assignments"].values()]
+        assert len(owners) == len(set(view["assignments"])), view
+        assert all(v["owner"] for v in view["assignments"].values()), view
+
+        # 第二轮最后一次确认：完成并在同一事务形成第三轮交接
+        code, body = http_request(
+            "POST", f"{base}/v1/confirms",
+            {"request_id": "smoke-c2", "member": "b", "parts": ["1", "3", "5"]},
+        )
+        assert code == 200 and body["status"] == "completed", body
+        nxt = body["next_handover"]
+        assert nxt["request_id"] == "smoke-r3" and nxt["status"] == "revoking", body
+
+        code, hv = http_request("GET", f"{base}/v1/handover")
+        assert code == 200 and hv["active"] and hv["request_id"] == "smoke-r3", hv
+        assert "queued_snapshot" not in hv, hv
+        assert {r["part"]: r["target"] for r in hv["revocations"]} == {
+            "0": "c", "1": "d", "2": "c", "3": "d", "4": "c", "5": "d"
+        }, hv
+        code, view = http_request("GET", f"{base}/v1/assignments?member=d")
+        assert view["assignments"] == {}, view
+
+        # 重启：第三轮交接与最终结论必须保持
+        stop_server(proc)
+        proc = start_server()
+        code, hv = http_request("GET", f"{base}/v1/handover")
+        assert hv["active"] and hv["request_id"] == "smoke-r3", hv
         for req_id, member, parts in (
-            ("smoke-c1", "a", ["0", "2", "4"]),
-            ("smoke-c2", "b", ["1", "3", "5"]),
+            ("smoke-c3", "b", ["0", "2", "4"]),
+            ("smoke-c4", "c", ["1", "3", "5"]),
         ):
             code, body = http_request(
                 "POST", f"{base}/v1/confirms",
                 {"request_id": req_id, "member": member, "parts": parts},
             )
             assert code == 200, body
-            replay_code, replay = http_request(
-                "POST", f"{base}/v1/confirms",
-                {"request_id": req_id, "member": member, "parts": parts},
-            )
-            assert replay_code == 200 and replay == body, "重传必须返回首次结果"
-
         code, view = http_request("GET", f"{base}/v1/assignments")
         owners = {p: v["owner"] for p, v in view["assignments"].items()}
-        assert view["epoch"] == 2, view
+        assert view["epoch"] == 4, view
         assert owners == {
-            "0": "b", "1": "c", "2": "b", "3": "c", "4": "b", "5": "c"
+            "0": "c", "1": "d", "2": "c", "3": "d", "4": "c", "5": "d"
         }, owners
-        print("API 冒烟通过：健康检查、撤销隔离、失效拒绝、幂等重放、交接发布")
+
+        # 再重启：结论不变，已受理快照不丢失
+        stop_server(proc)
+        proc = start_server()
+        code, hv = http_request("GET", f"{base}/v1/handover")
+        assert code == 200 and not hv["active"], hv
+        code, view = http_request("GET", f"{base}/v1/assignments")
+        owners = {p: v["owner"] for p, v in view["assignments"].items()}
+        assert owners == {
+            "0": "c", "1": "d", "2": "c", "3": "d", "4": "c", "5": "d"
+        }, owners
+        print(
+            "API 冒烟通过：排队受理、冲突规则、撤销隔离、失效拒绝、幂等重放、"
+            "末次确认串联下一轮、重启收敛、单一归属"
+        )
         ok = True
     except AssertionError as exc:
         print(f"API 冒烟失败: {exc}", flush=True)
@@ -153,11 +245,7 @@ def run_api_smoke() -> bool:
         except Exception:
             pass
     finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        stop_server(proc)
         tmp.cleanup()
     return ok
 

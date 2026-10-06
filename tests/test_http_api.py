@@ -99,6 +99,89 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(set(body["assignments"]), {"1", "3", "5"})
 
+    def test_three_snapshot_chain_queued_then_converges_over_http(self) -> None:
+        # 第一次：稳定
+        code, _ = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r1", "members": ["a", "b"]},
+        )
+        self.assertEqual(code, 200)
+        # 第二次：触发撤销
+        code, body = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r2", "members": ["b", "c"]},
+        )
+        self.assertEqual(code, 202)
+        self.assertEqual(body["status"], "revoking")
+        # 第三次：撤销期间受理为 queued
+        code, queued = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r3", "members": ["c", "d"]},
+        )
+        self.assertEqual(code, 202)
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["after_handover"], "r2")
+
+        # 冲突规则：同标识不同成员、已有另一份等待快照
+        code, body = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r3", "members": ["c", "z"]},
+        )
+        self.assertEqual(code, 409)
+        self.assertEqual(body["error"], "idempotency_conflict")
+        code, body = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r4", "members": ["z"]},
+        )
+        self.assertEqual(code, 409)
+        self.assertEqual(body["error"], "deferred_snapshot_pending")
+        # 相同标识 + 相同成员快照稳定重放
+        code, replay = request(
+            "POST", f"{self.base}/v1/snapshots",
+            {"request_id": "r3", "members": ["c", "d"]},
+        )
+        self.assertEqual(code, 202)
+        self.assertEqual(replay, queued)
+
+        # 完成第二轮
+        code, body = request(
+            "POST", f"{self.base}/v1/confirms",
+            {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]},
+        )
+        self.assertEqual(code, 200)
+        self.assertNotIn("next_handover", body)
+        code, body = request(
+            "POST", f"{self.base}/v1/confirms",
+            {"request_id": "c2", "member": "b", "parts": ["1", "3", "5"]},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["remaining"], [])
+        self.assertEqual(body["next_handover"]["request_id"], "r3")
+
+        # 第三轮交接已开始；目标 d 确认前拿不到分区
+        code, hv = request("GET", f"{self.base}/v1/handover")
+        self.assertTrue(hv["active"])
+        self.assertEqual(hv["request_id"], "r3")
+        self.assertNotIn("queued_snapshot", hv)
+        code, view = request("GET", f"{self.base}/v1/assignments?member=d")
+        self.assertEqual(view["assignments"], {})
+
+        # 完成第三轮
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c3", "member": "b", "parts": ["0", "2", "4"]})
+        code, body = request(
+            "POST", f"{self.base}/v1/confirms",
+            {"request_id": "c4", "member": "c", "parts": ["1", "3", "5"]},
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "completed")
+        code, view = request("GET", f"{self.base}/v1/assignments")
+        self.assertEqual(
+            {p: v["owner"] for p, v in view["assignments"].items()},
+            {"0": "c", "1": "d", "2": "c", "3": "d", "4": "c", "5": "d"},
+        )
+
     def test_invalid_confirmations_are_rejected(self) -> None:
         request("POST", f"{self.base}/v1/snapshots",
                 {"request_id": "r1", "members": ["a", "b"]})
