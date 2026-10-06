@@ -9,6 +9,9 @@
   旧完整分配，或与已确认释放一致的中间分配。
 * 所有写接口以稳定请求标识幂等：相同请求重放首次结果；
   相同请求标识携带不同快照明确冲突。
+* 交接进行中提交的后续快照会被**受理并排队**（``deferred_snapshot``），
+  在前一轮最后一次确认的同一事务内，基于已持久化的当前归属形成下一轮交接；
+  受理结果与排队结果都占用请求标识，崩溃/重启不丢失。
 """""
 
 from __future__ import annotations
@@ -64,6 +67,9 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema(partition_count)
+        # 恢复：上一轮交接已完成、已受理的排队快照却未及推进时（旧版本数据或
+        # 历史边界），基于持久化当前归属补齐下一轮，不丢失已受理快照。
+        self._recover_deferred()
 
     # ------------------------------------------------------------------ schema
 
@@ -359,33 +365,25 @@ class Store:
 
                 active = self._active_handover(conn)
                 if active is not None:
-                    # 交接进行中：不接受新目标，调用方须以已持久化目标重新收敛。
-                    # 这是暂时性拒绝，不占用请求标识。
+                    # 交接进行中：受理后续完整快照并持久化排队，
+                    # 在前一轮最后一次确认的同一事务内继续形成下一轮交接。
+                    # 受理即占用请求标识，崩溃/重启不丢失。
                     deferred = conn.execute(
                         "SELECT * FROM deferred_snapshot WHERE id = 1"
                     ).fetchone()
                     if deferred is not None:
-                        if (
-                            deferred["request_id"] != req_id
-                            or deferred["snapshot_json"] != snapshot_key
-                        ):
-                            body = {
-                                "error": "deferred_snapshot_pending",
-                                "message": "已有成员快照等待当前交接完成",
-                                "request_id": req_id,
-                                "after_handover": active["req_id"],
-                            }
-                            conn.execute("ROLLBACK")
-                            return CONFLICT, body
+                        # 能走到这里说明 req_id 未被占用（占用的同标识请求在上方
+                        # 已重放/冲突），因此必是另一份不同标识的等待快照 -> 冲突。
                         body = {
-                            "status": "queued",
+                            "error": "deferred_snapshot_pending",
+                            "message": "已有成员快照等待当前交接完成",
                             "request_id": req_id,
                             "after_handover": active["req_id"],
-                            "target": json.loads(active["target_json"]),
                         }
-                        conn.execute("COMMIT")
-                        return ACCEPTED, body
+                        conn.execute("ROLLBACK")
+                        return CONFLICT, body
 
+                    active_target = json.loads(active["target_json"])
                     conn.execute(
                         "INSERT INTO deferred_snapshot(id, request_id, snapshot_json,"
                         " after_handover_id, created_at) VALUES (1, ?, ?, ?, ?)",
@@ -393,101 +391,212 @@ class Store:
                     )
                     body = {
                         "status": "queued",
-                        "message": "成员快照将在当前交接完成后处理",
+                        "message": "成员快照已受理，将在当前交接完成后继续交接",
                         "request_id": req_id,
                         "after_handover": active["req_id"],
-                        "target": json.loads(active["target_json"]),
+                        "target": active_target,
                     }
+                    # 受理结果持久化：相同标识重传稳定重放 queued。
+                    self._record(conn, req_id, "snapshot", ordered, ACCEPTED, body)
                     conn.execute("COMMIT")
                     return ACCEPTED, body
 
-                count = self._partition_count(conn)
                 epoch = self._epoch(conn)
-                current_rows = conn.execute(
-                    "SELECT part, owner FROM assignments"
-                ).fetchall()
-                current = {r["part"]: r["owner"] for r in current_rows}
-
-                def choose(part: str) -> str:
-                    # 成员标识 + 分区号确定的稳定目标
-                    return ordered[int(part) % len(ordered)]
-
-                parts = (
-                    [str(i) for i in range(count)]
-                    if not current
-                    else list(current)
+                code, body = self._apply_direct_snapshot(
+                    conn, req_id, ordered, snapshot_key, epoch
                 )
-                target = {part: choose(part) for part in sorted(parts, key=_part_key)}
-
-                grants: list[str] = []
-                revokes: list[dict[str, str]] = []
-                for part, new_owner in target.items():
-                    old_owner = current.get(part)
-                    if old_owner is None:
-                        grants.append(part)
-                    elif old_owner not in members or old_owner != new_owner:
-                        revokes.append(
-                            {"part": part, "owner": old_owner, "target": new_owner}
-                        )
-                # 交接前沿：仅仍需旧实例释放的分区 -> 新目标
-                revoke_target = {item["part"]: item["target"] for item in revokes}
-
-                for part in grants:
-                    conn.execute(
-                        "INSERT INTO assignments(part, owner, epoch)"
-                        " VALUES (?, ?, ?) ON CONFLICT(part) DO"
-                        " UPDATE SET owner = excluded.owner, epoch = excluded.epoch",
-                        (part, target[part], epoch),
-                    )
-
-                if not revokes:
-                    # 没有需要旧实例释放的分区：新视图立即生效，不产生代次推进。
-                    body = {
-                        "status": "stable",
-                        "epoch": epoch,
-                        "request_id": req_id,
-                        "assigned": sorted(target, key=_part_key),
-                    }
-                    self._record(conn, req_id, "snapshot", ordered, OK, body)
-                    conn.execute("COMMIT")
-                    return OK, body
-
-                for item in revokes:
-                    conn.execute(
-                        "INSERT INTO revocations(part, owner, target, epoch,"
-                        " req_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            item["part"],
-                            item["owner"],
-                            item["target"],
-                            epoch,
-                            req_id,
-                            _now(),
-                        ),
-                    )
-                conn.execute(
-                    "INSERT INTO handover_state(id, req_id, snapshot_json,"
-                    " target_json, status, created_at) VALUES (1, ?, ?, ?,"
-                    " 'pending', ?) ON CONFLICT(id) DO UPDATE SET"
-                    " req_id = excluded.req_id,"
-                    " snapshot_json = excluded.snapshot_json,"
-                    " target_json = excluded.target_json,"
-                    " status = 'pending',"
-                    " result_json = NULL,"
-                    " created_at = excluded.created_at,"
-                    " completed_at = NULL",
-                    (req_id, snapshot_key, _canonical_json(revoke_target), _now()),
-                )
-                body = {
-                    "status": "revoking",
-                    "epoch": epoch,
-                    "request_id": req_id,
-                    "assigned_now": sorted(grants, key=_part_key),
-                    "revocations": sorted(revokes, key=lambda x: _part_key(x["part"])),
-                }
-                self._record(conn, req_id, "snapshot", ordered, ACCEPTED, body)
                 conn.execute("COMMIT")
-                return ACCEPTED, body
+                return code, body
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _plan(
+        self, conn: sqlite3.Connection, ordered: list[str]
+    ) -> tuple[dict[str, str], list[str], list[dict[str, str]]]:
+        """基于已持久化的当前归属计算目标分配与直接授予/待撤销集合。"""
+        count = self._partition_count(conn)
+        current_rows = conn.execute(
+            "SELECT part, owner FROM assignments"
+        ).fetchall()
+        current = {r["part"]: r["owner"] for r in current_rows}
+        members = set(ordered)
+
+        def choose(part: str) -> str:
+            # 成员标识 + 分区号确定的稳定目标
+            return ordered[int(part) % len(ordered)]
+
+        parts = (
+            [str(i) for i in range(count)]
+            if not current
+            else list(current)
+        )
+        target = {part: choose(part) for part in sorted(parts, key=_part_key)}
+
+        grants: list[str] = []
+        revokes: list[dict[str, str]] = []
+        for part, new_owner in target.items():
+            old_owner = current.get(part)
+            if old_owner is None:
+                grants.append(part)
+            elif old_owner not in members or old_owner != new_owner:
+                # 需要撤销的分区仍只能由当时持有者释放
+                revokes.append(
+                    {"part": part, "owner": old_owner, "target": new_owner}
+                )
+        return target, grants, revokes
+
+    def _apply_direct_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        req_id: str,
+        ordered: list[str],
+        snapshot_key: str,
+        epoch: int,
+    ) -> tuple[int, dict[str, Any]]:
+        """无进行中交接时：直接授予空分区，或开启一轮新的撤销交接。"""
+        target, grants, revokes = self._plan(conn, ordered)
+        # 交接前沿：仅仍需旧实例释放的分区 -> 新目标
+        revoke_target = {item["part"]: item["target"] for item in revokes}
+
+        for part in grants:
+            conn.execute(
+                "INSERT INTO assignments(part, owner, epoch)"
+                " VALUES (?, ?, ?) ON CONFLICT(part) DO"
+                " UPDATE SET owner = excluded.owner, epoch = excluded.epoch",
+                (part, target[part], epoch),
+            )
+
+        if not revokes:
+            # 没有需要旧实例释放的分区：新视图立即生效，不产生代次推进。
+            body = {
+                "status": "stable",
+                "epoch": epoch,
+                "request_id": req_id,
+                "assigned": sorted(target, key=_part_key),
+            }
+            self._record(conn, req_id, "snapshot", ordered, OK, body)
+            return OK, body
+
+        for item in revokes:
+            conn.execute(
+                "INSERT INTO revocations(part, owner, target, epoch,"
+                " req_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    item["part"],
+                    item["owner"],
+                    item["target"],
+                    epoch,
+                    req_id,
+                    _now(),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO handover_state(id, req_id, snapshot_json,"
+            " target_json, status, created_at) VALUES (1, ?, ?, ?,"
+            " 'pending', ?) ON CONFLICT(id) DO UPDATE SET"
+            " req_id = excluded.req_id,"
+            " snapshot_json = excluded.snapshot_json,"
+            " target_json = excluded.target_json,"
+            " status = 'pending',"
+            " result_json = NULL,"
+            " created_at = excluded.created_at,"
+            " completed_at = NULL",
+            (req_id, snapshot_key, _canonical_json(revoke_target), _now()),
+        )
+        body = {
+            "status": "revoking",
+            "epoch": epoch,
+            "request_id": req_id,
+            "assigned_now": sorted(grants, key=_part_key),
+            "revocations": sorted(revokes, key=lambda x: _part_key(x["part"])),
+        }
+        self._record(conn, req_id, "snapshot", ordered, ACCEPTED, body)
+        return ACCEPTED, body
+
+    def _promote_deferred(
+        self, conn: sqlite3.Connection, epoch: int
+    ) -> dict[str, Any] | None:
+        """消费已受理排队快照，基于当前归属形成下一轮一致交接。
+
+        与触发它的最后一次确认在同一事务内执行；直接授予的分区以 ``epoch``
+        公布，待撤销分区仍记在原持有者名下。返回下一轮交接描述；无排队则 None。
+        """
+        row = conn.execute(
+            "SELECT * FROM deferred_snapshot WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        req_id = row["request_id"]
+        ordered: list[str] = json.loads(row["snapshot_json"])
+        target, grants, revokes = self._plan(conn, ordered)
+        # 受理快照只在真正开始处理时移出排队表，崩溃回滚不会丢失。
+        conn.execute("DELETE FROM deferred_snapshot WHERE id = 1")
+
+        for part in grants:
+            conn.execute(
+                "INSERT INTO assignments(part, owner, epoch)"
+                " VALUES (?, ?, ?) ON CONFLICT(part) DO"
+                " UPDATE SET owner = excluded.owner, epoch = excluded.epoch",
+                (part, target[part], epoch),
+            )
+
+        if not revokes:
+            return {
+                "request_id": req_id,
+                "members": ordered,
+                "status": "stable",
+                "revocations": [],
+            }
+
+        revoke_target = {item["part"]: item["target"] for item in revokes}
+        for item in revokes:
+            conn.execute(
+                "INSERT INTO revocations(part, owner, target, epoch,"
+                " req_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    item["part"],
+                    item["owner"],
+                    item["target"],
+                    epoch,
+                    req_id,
+                    _now(),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO handover_state(id, req_id, snapshot_json,"
+            " target_json, status, created_at) VALUES (1, ?, ?, ?,"
+            " 'pending', ?) ON CONFLICT(id) DO UPDATE SET"
+            " req_id = excluded.req_id,"
+            " snapshot_json = excluded.snapshot_json,"
+            " target_json = excluded.target_json,"
+            " status = 'pending',"
+            " result_json = NULL,"
+            " created_at = excluded.created_at,"
+            " completed_at = NULL",
+            (req_id, row["snapshot_json"], _canonical_json(revoke_target), _now()),
+        )
+        return {
+            "request_id": req_id,
+            "members": ordered,
+            "status": "revoking",
+            "revocations": sorted(revokes, key=lambda x: _part_key(x["part"])),
+        }
+
+    def _recover_deferred(self) -> None:
+        """启动恢复：上一轮已完成但排队快照尚未推进（旧版本/极端边界）时补齐。"""
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                active = self._active_handover(conn)
+                if active is None:
+                    deferred = conn.execute(
+                        "SELECT * FROM deferred_snapshot WHERE id = 1"
+                    ).fetchone()
+                    if deferred is not None:
+                        self._promote_deferred(conn, self._epoch(conn))
+                conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
@@ -612,10 +721,14 @@ class Store:
                         ),
                     )
                     status = "completed"
+                    # 同一事务内消费已受理的后续快照，基于刚持久化的当前归属
+                    # 形成下一轮一致交接；崩溃则整体回滚，受理快照不丢失。
+                    nxt = self._promote_deferred(conn, new_epoch)
                 else:
                     status = "partially_released"
+                    nxt = None
 
-                body = {
+                body: dict[str, Any] = {
                     "status": status,
                     "epoch": new_epoch,
                     "request_id": req_id,
@@ -627,6 +740,13 @@ class Store:
                         )
                     ],
                 }
+                if nxt is not None:
+                    body["next_handover"] = {
+                        "status": nxt["status"],
+                        "request_id": nxt["request_id"],
+                        "members": nxt["members"],
+                        "revocations": nxt["revocations"],
+                    }
                 return finish(OK, body)
             except Exception:
                 conn.execute("ROLLBACK")
